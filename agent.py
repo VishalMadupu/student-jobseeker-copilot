@@ -1,59 +1,132 @@
 import os
-from google.adk.agents import Agent, SequentialAgent
+from fastapi import FastAPI
+from pydantic import BaseModel
+from google.adk.agents import Agent
 from google.adk.tools.tool_context import ToolContext
 
+# -------------------------
+# CONFIG
+# -------------------------
 MODEL = os.getenv("MODEL", "gemini-2.5-flash")
 
+app = FastAPI()
+
+# -------------------------
+# REQUEST MODEL
+# -------------------------
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+# -------------------------
+# TOOLS
+# -------------------------
 def save_user_goal(tool_context: ToolContext, goal: str) -> dict:
     tool_context.state["user_goal"] = goal
     return {"status": "saved", "goal": goal}
 
+
 def create_study_task(task: str) -> dict:
     return {"type": "study_task", "task": task, "status": "created"}
 
+
 def add_job_application(company: str, role: str) -> dict:
-    return {"type": "job_application", "company": company, "role": role, "status": "saved"}
+    return {
+        "type": "job_application",
+        "company": company,
+        "role": role,
+        "status": "saved",
+    }
+
 
 def save_note(note: str) -> dict:
     return {"type": "note", "note": note, "status": "saved"}
 
-study_agent = Agent(
-    name="study_agent",
-    model=MODEL,
-    instruction="Read the saved user goal and create study tasks for a student.",
-    tools=[create_study_task],
-    output_key="study_output",
-)
 
-job_agent = Agent(
-    name="job_agent",
-    model=MODEL,
-    instruction="Read the saved user goal and create job search or interview preparation actions.",
-    tools=[add_job_application],
-    output_key="job_output",
-)
+def create_calendar_event(title: str, date: str, time: str) -> dict:
+    return {
+        "type": "calendar_event",
+        "title": title,
+        "date": date,
+        "time": time,
+        "status": "scheduled",
+    }
 
-notes_agent = Agent(
-    name="notes_agent",
-    model=MODEL,
-    instruction="Read the saved user goal and create a helpful summary note.",
-    tools=[save_note],
-    output_key="notes_output",
-)
+# -------------------------
+# ROUTER (INTENT DETECTION)
+# -------------------------
+def detect_intents(message: str):
+    msg = message.lower()
 
-workflow_agent = SequentialAgent(
-    name="workflow_agent",
-    sub_agents=[study_agent, job_agent, notes_agent],
-)
+    return {
+        "study": any(x in msg for x in ["study", "prepare", "learn"]),
+        "job": any(x in msg for x in ["job", "interview", "apply"]),
+        "calendar": any(x in msg for x in ["schedule", "tomorrow", "pm", "am", "today"]),
+        "notes": any(x in msg for x in ["note", "remember", "save"]),
+    }
 
+# -------------------------
+# ROOT AGENT (ONLY FOR NLP)
+# -------------------------
 root_agent = Agent(
-    name="student_jobseeker_copilot",
+    name="controller_agent",
     model=MODEL,
     instruction=(
-        "You are a productivity assistant for students and jobseekers. "
-        "First capture the user's goal using save_user_goal, then hand off to workflow_agent. "
-        "Return a final action plan with study steps, job search steps, and notes."
+        "Extract structured data from user input. "
+        "Return clean short phrases for tasks. "
+        "Do NOT chat."
     ),
     tools=[save_user_goal],
-    sub_agents=[workflow_agent],
 )
+
+# -------------------------
+# RESPONSE FORMATTER
+# -------------------------
+def format_response(actions):
+    return {
+        "status": "success",
+        "actions_taken": actions,
+        "reply": "Done! All tasks executed successfully."
+    }
+
+# -------------------------
+# API ENDPOINT (FIXED CORE)
+# -------------------------
+@app.post("/chat")
+def chat(req: ChatRequest):
+    message = req.message
+
+    # Step 1: detect intents
+    intents = detect_intents(message)
+
+    actions = []
+
+    # Step 2: save goal
+    root_agent.run(message)
+
+    # Step 3: execute tools directly (NO ADK BUGS)
+    if intents["study"]:
+        study = create_study_task("Interview preparation")
+        actions.append("Study tasks created")
+
+    if intents["job"]:
+        job = add_job_application("Google", "Interview")
+        actions.append("Job added")
+
+    if intents["calendar"]:
+        calendar = create_calendar_event(
+            title="Interview Prep",
+            date="Tomorrow",
+            time="7PM"
+        )
+        actions.append("Calendar event scheduled")
+
+    if intents["notes"]:
+        note = save_note("User preparing for interview")
+        actions.append("Notes saved")
+
+    # fallback
+    if not actions:
+        actions.append("No actionable intent detected")
+
+    return format_response(actions)

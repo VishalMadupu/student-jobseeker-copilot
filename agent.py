@@ -1,132 +1,178 @@
+from __future__ import annotations
+
 import os
-from fastapi import FastAPI
-from pydantic import BaseModel
-from google.adk.agents import Agent
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.tools.tool_context import ToolContext
+from mcp import StdioServerParameters
 
-# -------------------------
-# CONFIG
-# -------------------------
+load_dotenv()
+
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
+LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("REGION") or "us-central1"
 MODEL = os.getenv("MODEL", "gemini-2.5-flash")
+MCP_SERVER_PATH = Path(__file__).with_name("mcp_server.py")
 
-app = FastAPI()
+if PROJECT_ID:
+    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", PROJECT_ID)
 
-# -------------------------
-# REQUEST MODEL
-# -------------------------
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-
-# -------------------------
-# TOOLS
-# -------------------------
-def save_user_goal(tool_context: ToolContext, goal: str) -> dict:
-    tool_context.state["user_goal"] = goal
-    return {"status": "saved", "goal": goal}
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", LOCATION)
+os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE"))
 
 
-def create_study_task(task: str) -> dict:
-    return {"type": "study_task", "task": task, "status": "created"}
+def capture_request(tool_context: ToolContext, prompt: str) -> dict[str, str]:
+    """Store the latest prompt and user identity in session state."""
+    cleaned_prompt = " ".join(prompt.strip().split())
+    tool_context.state["request_prompt"] = cleaned_prompt
+    tool_context.state["request_received_at"] = datetime.now(timezone.utc).isoformat()
 
+    if not tool_context.state.get("user_id"):
+        invocation_context = getattr(tool_context, "_invocation_context", None)
+        inferred_user_id = getattr(invocation_context, "user_id", None) or "anonymous"
+        tool_context.state["user_id"] = inferred_user_id
 
-def add_job_application(company: str, role: str) -> dict:
     return {
-        "type": "job_application",
-        "company": company,
-        "role": role,
-        "status": "saved",
+        "status": "captured",
+        "user_id": str(tool_context.state["user_id"]),
+        "request_prompt": cleaned_prompt,
     }
 
 
-def save_note(note: str) -> dict:
-    return {"type": "note", "note": note, "status": "saved"}
+def build_productivity_toolset() -> McpToolset:
+    return McpToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(
+                command=sys.executable,
+                args=[str(MCP_SERVER_PATH)],
+            )
+        )
+    )
 
 
-def create_calendar_event(title: str, date: str, time: str) -> dict:
-    return {
-        "type": "calendar_event",
-        "title": title,
-        "date": date,
-        "time": time,
-        "status": "scheduled",
-    }
+productivity_mcp_toolset = build_productivity_toolset()
 
-# -------------------------
-# ROUTER (INTENT DETECTION)
-# -------------------------
-def detect_intents(message: str):
-    msg = message.lower()
-
-    return {
-        "study": any(x in msg for x in ["study", "prepare", "learn"]),
-        "job": any(x in msg for x in ["job", "interview", "apply"]),
-        "calendar": any(x in msg for x in ["schedule", "tomorrow", "pm", "am", "today"]),
-        "notes": any(x in msg for x in ["note", "remember", "save"]),
-    }
-
-# -------------------------
-# ROOT AGENT (ONLY FOR NLP)
-# -------------------------
-root_agent = Agent(
-    name="controller_agent",
+planning_agent = LlmAgent(
+    name="planning_agent",
     model=MODEL,
-    instruction=(
-        "Extract structured data from user input. "
-        "Return clean short phrases for tasks. "
-        "Do NOT chat."
-    ),
-    tools=[save_user_goal],
+    description="Breaks a productivity request into structured actions.",
+    instruction="""
+You are the planning specialist for a student and jobseeker productivity assistant.
+
+Use the latest state to build an execution plan:
+- user_id: {user_id}
+- request_prompt: {request_prompt}
+
+Return valid JSON only.
+
+Your JSON must contain these top-level keys:
+- intent
+- tasks
+- applications
+- notes
+- events
+- retrieval_queries
+- assumptions
+
+Rules:
+- Use tasks for study plans, preparation items, reminders, and to-dos.
+- Use applications for job tracking items.
+- Use notes for reusable preparation notes or saved context.
+- Use events for time-bound calendar-style items.
+- Use retrieval_queries when the user wants to review or summarize what is already stored.
+- Make reasonable assumptions when the user is underspecified, and record them in assumptions.
+- Do not add markdown or commentary outside the JSON object.
+""",
+    output_key="workflow_plan",
 )
 
-# -------------------------
-# RESPONSE FORMATTER
-# -------------------------
-def format_response(actions):
-    return {
-        "status": "success",
-        "actions_taken": actions,
-        "reply": "Done! All tasks executed successfully."
-    }
+execution_agent = LlmAgent(
+    name="execution_agent",
+    model=MODEL,
+    description="Uses MCP tools to store and retrieve structured productivity data.",
+    instruction="""
+You are the execution specialist for a multi-agent productivity assistant.
 
-# -------------------------
-# API ENDPOINT (FIXED CORE)
-# -------------------------
-@app.post("/chat")
-def chat(req: ChatRequest):
-    message = req.message
+You must use tools to complete the plan.
 
-    # Step 1: detect intents
-    intents = detect_intents(message)
+State you can rely on:
+- user_id: {user_id}
+- request_prompt: {request_prompt}
+- workflow_plan: {workflow_plan}
 
-    actions = []
+Available MCP tools:
+- create_task
+- list_tasks
+- track_application
+- list_applications
+- save_note
+- list_notes
+- schedule_event
+- list_events
+- get_dashboard
 
-    # Step 2: save goal
-    root_agent.run(message)
+Rules:
+- Always pass user_id = {user_id} in every tool call.
+- If workflow_plan includes retrieval_queries, run the relevant list tools before summarizing.
+- If workflow_plan includes tasks, applications, notes, or events, persist them with the MCP tools.
+- Prefer storing concrete, useful records rather than vague placeholders.
+- Never invent a tool result. Use the real tool output.
 
-    # Step 3: execute tools directly (NO ADK BUGS)
-    if intents["study"]:
-        study = create_study_task("Interview preparation")
-        actions.append("Study tasks created")
+Return valid JSON only with these top-level keys:
+- actions_completed
+- created_records
+- retrieved_records
+- assumptions
+""",
+    tools=[productivity_mcp_toolset],
+    output_key="execution_report",
+)
 
-    if intents["job"]:
-        job = add_job_application("Google", "Interview")
-        actions.append("Job added")
+summary_agent = LlmAgent(
+    name="summary_agent",
+    model=MODEL,
+    description="Summarizes the workflow result into a concise user-facing response.",
+    instruction="""
+You are the user-facing response specialist.
 
-    if intents["calendar"]:
-        calendar = create_calendar_event(
-            title="Interview Prep",
-            date="Tomorrow",
-            time="7PM"
-        )
-        actions.append("Calendar event scheduled")
+Use this state:
+- request_prompt: {request_prompt}
+- workflow_plan: {workflow_plan}
+- execution_report: {execution_report}
 
-    if intents["notes"]:
-        note = save_note("User preparing for interview")
-        actions.append("Notes saved")
+Write a concise, practical response that:
+- confirms what was stored or retrieved
+- highlights any assumptions
+- suggests the next best action if helpful
 
-    # fallback
-    if not actions:
-        actions.append("No actionable intent detected")
+Do not mention internal state keys or JSON formatting.
+""",
+)
 
-    return format_response(actions)
+productivity_workflow = SequentialAgent(
+    name="productivity_workflow",
+    description="Runs planning, tool execution, and summarization in a fixed order.",
+    sub_agents=[planning_agent, execution_agent, summary_agent],
+)
+
+root_agent = LlmAgent(
+    name="controller_agent",
+    model=MODEL,
+    description="Primary coordinator agent for the student-jobseeker productivity assistant.",
+    instruction="""
+You are the controller agent for a multi-agent productivity assistant.
+
+For every new user message:
+1. Call the capture_request tool with the user's full latest message.
+2. Transfer control to the productivity_workflow sub-agent.
+
+Do not answer directly before the workflow runs.
+""",
+    tools=[capture_request],
+    sub_agents=[productivity_workflow],
+)

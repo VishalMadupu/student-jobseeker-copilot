@@ -13,7 +13,10 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from student_jobseeker_copilot.agent import root_agent
+try:
+    from student_jobseeker_copilot.agent import root_agent
+except ModuleNotFoundError:
+    from agent import root_agent
 from storage import get_storage
 
 load_dotenv()
